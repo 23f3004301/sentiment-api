@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 import json
@@ -6,18 +7,26 @@ import os
 
 app = FastAPI()
 
-# ── AI Pipe config ──────────────────────────────────────────────
-client = OpenAI(api_key= os.environ.get("AIPIPE_TOKEN"), base_url="https://aipipe.org/openai/v1")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ── Request & Response schemas ──────────────────────────────────
+client = OpenAI(
+    api_key=os.environ.get("AIPIPE_TOKEN"),
+    base_url="https://aipipe.org/openai/v1"
+)
+
 class CommentRequest(BaseModel):
     comment: str
 
 class SentimentResponse(BaseModel):
-    sentiment: str   # "positive", "negative", "neutral"
-    rating: int      # 1-5
+    sentiment: str
+    rating: int
 
-# ── The JSON schema we enforce on the model ─────────────────────
 SENTIMENT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -35,12 +44,10 @@ SENTIMENT_SCHEMA = {
     "additionalProperties": False
 }
 
-# ── Endpoint ────────────────────────────────────────────────────
 @app.post("/comment", response_model=SentimentResponse)
 async def analyze_comment(request: CommentRequest):
     if not request.comment or not request.comment.strip():
         raise HTTPException(status_code=422, detail="Comment cannot be empty")
-
     try:
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -49,18 +56,13 @@ async def analyze_comment(request: CommentRequest):
                     "role": "system",
                     "content": (
                         "You are a sentiment analysis engine. "
-                        "Analyze the given comment and return:\n"
-                        "- sentiment: 'positive', 'negative', or 'neutral'\n"
-                        "- rating: integer 1-5 "
-                        "(5=very positive, 3=neutral, 1=very negative)"
+                        "Analyze the comment and return sentiment "
+                        "('positive','negative','neutral') and "
+                        "rating (1-5 where 5=very positive, 1=very negative)."
                     )
                 },
-                {
-                    "role": "user",
-                    "content": request.comment
-                }
+                {"role": "user", "content": request.comment}
             ],
-            # ✅ This is the KEY part — enforcing structured output
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -70,10 +72,8 @@ async def analyze_comment(request: CommentRequest):
                 }
             }
         )
-
         result = json.loads(response.choices[0].message.content)
         return SentimentResponse(**result)
-
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="Model returned invalid JSON")
     except Exception as e:
