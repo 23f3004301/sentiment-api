@@ -2,14 +2,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from openai import OpenAI
 import json
+import os
 
 app = FastAPI()
 
 # ── AI Pipe config ──────────────────────────────────────────────
-client = OpenAI(
-    api_key="eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjMwMDQzMDFAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.c78hKkboZXsPTMZGeGxjkBLNteWDtZ9Eq_0W0AejpYE",          # paste your token
-    base_url="https://aipipe.org/openai/v1"    # AI Pipe proxy URL
-)
+client = OpenAI(api_key= os.environ.get("AIPIPE_TOKEN"), base_url="https://aipipe.org/openai/v1")
 
 # ── Request & Response schemas ──────────────────────────────────
 class CommentRequest(BaseModel):
