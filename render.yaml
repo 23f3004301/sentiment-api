@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: sentiment-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: AIPIPE_TOKEN
+        value: eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjMwMDQzMDFAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.c78hKkboZXsPTMZGeGxjkBLNteWDtZ9Eq_0W0AejpYE
