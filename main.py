@@ -170,6 +170,11 @@ async def code_interpreter(request: CodeRequest):
 
 # ─── YOUTUBE TIMESTAMP ENDPOINT ──────────────────────────────────────────────
 
+import glob
+import subprocess
+import tempfile
+import shutil
+
 class AskRequest(BaseModel):
     video_url: str
     topic: str
@@ -179,231 +184,200 @@ class AskResponse(BaseModel):
     video_url: str
     topic: str
 
-TIMESTAMP_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "timestamp": {
-            "type": "string",
-            "description": "Timestamp in HH:MM:SS format e.g. 00:05:47"
-        }
-    },
-    "required": ["timestamp"],
-    "additionalProperties": False
-}
+def get_video_id(url: str) -> str:
+    import re
+    m = re.search(r'(?:v=|youtu\.be/|/v/)([^&\n?#]+)', url)
+    return m.group(1) if m else None
 
-def parse_vtt_to_entries(vtt_content: str) -> list:
-    """Parse VTT into list of (seconds, text) tuples."""
-    entries = []
-    lines = vtt_content.split('\n')
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        ts_match = re.match(r'(\d{2}):(\d{2}):(\d{2})\.\d+', line)
-        if ts_match and '-->' in line:
-            h, m, s = int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3))
-            total_seconds = h * 3600 + m * 60 + s
-            i += 1
-            text_lines = []
-            while i < len(lines) and lines[i].strip() != '':
-                clean = re.sub(r'<[^>]+>', '', lines[i].strip())
-                if clean:
-                    text_lines.append(clean)
-                i += 1
-            if text_lines:
-                entries.append((total_seconds, ' '.join(text_lines)))
-        else:
-            i += 1
-    return entries
-
-def seconds_to_hhmmss(seconds: int) -> str:
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
+def seconds_to_hhmmss(sec: float) -> str:
+    sec = int(sec)
+    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-def fuzzy_search_transcript(entries: list, topic: str) -> int:
+def get_transcript_entries(video_url: str, tmpdir: str):
     """
-    Search transcript for topic. Returns best matching timestamp in seconds.
-    Strategy:
-    1. Direct substring match (case-insensitive)
-    2. Sliding window of 3-5 entries combined (for phrases split across lines)
-    3. Word overlap scoring
+    Returns list of (start_seconds, text) tuples.
+    Tries: 1) youtube-transcript-api  2) yt-dlp VTT
     """
-    topic_lower = topic.lower().strip()
-    topic_words = set(topic_lower.split())
+    import re as re2
 
-    best_score = 0
-    best_sec = None
+    # --- Method 1: youtube-transcript-api ---
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        video_id = get_video_id(video_url)
+        if video_id:
+            try:
+                api = YouTubeTranscriptApi()
+                transcript = api.fetch(video_id, languages=['en'])
+                entries = [(e.start, e.text) for e in transcript]
+                if entries:
+                    return entries
+            except Exception:
+                pass
+            # try without language filter
+            try:
+                api = YouTubeTranscriptApi()
+                listing = api.list(video_id)
+                transcript = listing.find_generated_transcript(['en']).fetch()
+                entries = [(e.start, e.text) for e in transcript]
+                if entries:
+                    return entries
+            except Exception:
+                pass
+    except ImportError:
+        pass
 
-    # Strategy 1 & 2: sliding window over 1, 3, 5 combined entries
-    for window in [1, 3, 5]:
-        for i in range(len(entries)):
-            chunk_entries = entries[i:i+window]
-            chunk_text = ' '.join(t for _, t in chunk_entries).lower()
-            start_sec = chunk_entries[0][0]
-
-            # Direct substring match - highest priority
-            if topic_lower in chunk_text:
-                return start_sec
-
-            # Word overlap score
-            chunk_words = set(chunk_text.split())
-            overlap = len(topic_words & chunk_words)
-            score = overlap / len(topic_words) if topic_words else 0
-
-            if score > best_score:
-                best_score = score
-                best_sec = start_sec
-
-    return best_sec
-
-def download_subtitles(video_url: str, tmpdir: str) -> str:
-    """Download subtitles. Returns path to VTT file or None."""
-    output_template = os.path.join(tmpdir, "subtitle")
-
-    for sub_flag in ["--write-auto-subs", "--write-subs"]:
+    # --- Method 2: yt-dlp VTT ---
+    output_template = os.path.join(tmpdir, "sub")
+    for flag in ["--write-auto-subs", "--write-subs"]:
         cmd = [
-            "yt-dlp",
-            sub_flag,
+            "yt-dlp", flag,
             "--skip-download",
             "--sub-lang", "en",
             "--sub-format", "vtt",
             "--output", output_template,
-            "--no-warnings",
-            "--quiet",
+            "--no-warnings", "--quiet",
             video_url
         ]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=120)
+        except Exception:
+            pass
         vtt_files = glob.glob(os.path.join(tmpdir, "*.vtt"))
         if vtt_files:
-            return vtt_files[0]
+            with open(vtt_files[0], 'r', encoding='utf-8') as f:
+                content = f.read()
+            entries = []
+            lines = content.split('\n')
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                ts = re2.match(r'(\d{2}):(\d{2}):(\d{2})\.\d+', line)
+                if ts and '-->' in line:
+                    h, m, s = int(ts.group(1)), int(ts.group(2)), int(ts.group(3))
+                    total_sec = h * 3600 + m * 60 + s
+                    i += 1
+                    text_parts = []
+                    while i < len(lines) and lines[i].strip():
+                        clean = re2.sub(r'<[^>]+>', '', lines[i].strip())
+                        if clean:
+                            text_parts.append(clean)
+                        i += 1
+                    if text_parts:
+                        entries.append((total_sec, ' '.join(text_parts)))
+                else:
+                    i += 1
+            if entries:
+                return entries
 
-    return None
+    return []
 
-def ai_search_transcript(entries: list, topic: str) -> str:
-    """Fallback: send transcript chunks to AI to find topic."""
-    # Build full transcript text
-    transcript_chunks = []
+def find_timestamp_with_ai(entries: list, topic: str) -> str:
+    """Send FULL transcript to AI in one call. 128k context fits any video."""
+    # Build timestamped transcript
+    lines = []
     for sec, text in entries:
         ts = seconds_to_hhmmss(sec)
-        transcript_chunks.append(f"[{ts}] {text}")
+        lines.append(f"[{ts}] {text}")
+    full_transcript = '\n'.join(lines)
 
-    full_transcript = '\n'.join(transcript_chunks)
+    # First try direct substring match (no AI needed, instant)
+    topic_lower = topic.lower().strip()
+    # sliding window of 1-5 consecutive entries
+    for window in [1, 2, 3, 5]:
+        for i in range(len(entries)):
+            chunk = entries[i:i+window]
+            combined = ' '.join(t for _, t in chunk).lower()
+            if topic_lower in combined:
+                return seconds_to_hhmmss(chunk[0][0])
+    # partial phrase match (first 30 chars of topic)
+    partial = topic_lower[:40]
+    for i in range(len(entries)):
+        chunk = entries[i:i+3]
+        combined = ' '.join(t for _, t in chunk).lower()
+        if partial in combined:
+            return seconds_to_hhmmss(chunk[0][0])
 
-    # Send in chunks of 15000 chars, ask AI which chunk has the topic
-    # First try first 30000 chars, then next 30000, etc.
-    chunk_size = 30000
-    for start in range(0, len(full_transcript), chunk_size):
-        chunk = full_transcript[start:start + chunk_size]
-        if topic.lower()[:20] in chunk.lower() or any(
-            w in chunk.lower() for w in topic.lower().split() if len(w) > 5
-        ):
-            # This chunk likely has the answer
-            prompt = f"""Find the EXACT timestamp when this topic/phrase is first spoken:
-"{topic}"
+    # Keyword match: find most keyword-dense segment
+    topic_words = [w for w in topic_lower.split() if len(w) > 4]
+    if topic_words:
+        best_score, best_sec = 0, None
+        for i in range(len(entries)):
+            chunk = entries[i:i+5]
+            combined = ' '.join(t for _, t in chunk).lower()
+            score = sum(1 for w in topic_words if w in combined)
+            if score > best_score:
+                best_score = score
+                best_sec = chunk[0][0]
+        if best_sec is not None and best_score >= max(2, len(topic_words) // 2):
+            return seconds_to_hhmmss(best_sec)
 
-TRANSCRIPT SECTION:
-{chunk}
+    # AI fallback: send full transcript (fits in 128k context)
+    # Truncate to 100k chars max (~75k tokens) if very long
+    if len(full_transcript) > 100000:
+        # Send in two halves if needed
+        half = len(full_transcript) // 2
+        segments = [full_transcript[:half + 5000], full_transcript[half - 5000:]]
+    else:
+        segments = [full_transcript]
 
-Return the HH:MM:SS timestamp from the transcript line that best matches the topic.
-If not found in this section, return "00:00:00"."""
+    for segment in segments:
+        prompt = f"""You are analyzing a YouTube video transcript with timestamps.
 
-            response = client.chat.completions.create(
-                model="gpt-4.1-mini",
-                messages=[
-                    {"role": "system", "content": "Return only a JSON with timestamp in HH:MM:SS format."},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "timestamp_finder",
-                        "strict": True,
-                        "schema": TIMESTAMP_SCHEMA
-                    }
-                }
-            )
-            result = json.loads(response.choices[0].message.content)
-            ts = result.get("timestamp", "00:00:00")
-            if ts != "00:00:00":
-                return ts
-
-    # Final fallback: send last section of transcript to AI
-    last_chunk = full_transcript[-30000:] if len(full_transcript) > 30000 else full_transcript
-    prompt = f"""In this YouTube video transcript, find when this topic is FIRST spoken:
+Find the FIRST moment this topic is spoken:
 "{topic}"
 
 TRANSCRIPT:
-{last_chunk[:15000]}
+{segment}
 
-Return the HH:MM:SS timestamp."""
+Return the HH:MM:SS timestamp from the transcript line where this topic FIRST appears.
+If not in this segment, return exactly: NOT_FOUND"""
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": "Return only JSON with timestamp in HH:MM:SS format."},
-            {"role": "user", "content": prompt}
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "timestamp_finder",
-                "strict": True,
-                "schema": TIMESTAMP_SCHEMA
-            }
-        }
-    )
-    result = json.loads(response.choices[0].message.content)
-    return result.get("timestamp", "00:00:00")
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": 'Return ONLY a JSON object: {"timestamp": "HH:MM:SS"} or {"timestamp": "NOT_FOUND"}'},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ts",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"timestamp": {"type": "string"}},
+                        "required": ["timestamp"],
+                        "additionalProperties": False
+                    }
+                }
+            },
+            max_tokens=50
+        )
+        result = json.loads(response.choices[0].message.content)
+        ts = result.get("timestamp", "NOT_FOUND")
+        if ts != "NOT_FOUND" and re.match(r'^\d{2}:\d{2}:\d{2}$', ts):
+            return ts
+
+    return "00:00:00"
 
 
 @app.post("/ask", response_model=AskResponse)
 async def find_timestamp(request: AskRequest):
     tmpdir = tempfile.mkdtemp()
     try:
-        # Step 1: Download subtitles
-        vtt_path = download_subtitles(request.video_url, tmpdir)
-
-        if vtt_path:
-            with open(vtt_path, 'r', encoding='utf-8') as f:
-                vtt_content = f.read()
-
-            entries = parse_vtt_to_entries(vtt_content)
-
-            if entries:
-                # Step 2: Direct fuzzy search first (fast, no AI needed)
-                best_sec = fuzzy_search_transcript(entries, request.topic)
-
-                if best_sec is not None:
-                    timestamp = seconds_to_hhmmss(best_sec)
-                    # Validate format
-                    if re.match(r'^\d{2}:\d{2}:\d{2}$', timestamp):
-                        return AskResponse(
-                            timestamp=timestamp,
-                            video_url=request.video_url,
-                            topic=request.topic
-                        )
-
-                # Step 3: AI-assisted search on full transcript
-                timestamp = ai_search_transcript(entries, request.topic)
-                if re.match(r'^\d{2}:\d{2}:\d{2}$', timestamp):
-                    return AskResponse(
-                        timestamp=timestamp,
-                        video_url=request.video_url,
-                        topic=request.topic
-                    )
-
-        # Final fallback
+        entries = get_transcript_entries(request.video_url, tmpdir)
+        
+        if not entries:
+            # No transcript available at all
+            raise HTTPException(status_code=400, detail="Could not download transcript for this video")
+        
+        timestamp = find_timestamp_with_ai(entries, request.topic)
+        
         return AskResponse(
-            timestamp="00:00:00",
+            timestamp=timestamp,
             video_url=request.video_url,
             topic=request.topic
         )
-
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Subtitle download timed out")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
