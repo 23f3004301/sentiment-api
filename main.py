@@ -12,6 +12,8 @@ import subprocess
 import re
 import tempfile
 import glob
+from google import genai as google_genai
+from google.genai import types as genai_types
 
 app = FastAPI()
 
@@ -27,7 +29,7 @@ client = OpenAI(
     api_key=os.environ.get("AIPIPE_TOKEN"),
     base_url="https://aipipe.org/openai/v1"
 )
-
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # ─── SENTIMENT ENDPOINT ───────────────────────────────────────────────────────
 class CommentRequest(BaseModel):
     comment: str
@@ -169,12 +171,7 @@ async def code_interpreter(request: CodeRequest):
     return CodeResponse(error=error_lines, result=execution_result["output"])
 
 # ─── YOUTUBE TIMESTAMP ENDPOINT ──────────────────────────────────────────────
-
-import glob, subprocess, tempfile, shutil, time
-import google.generativeai as genai
-
-# Configure Gemini
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# ── ASK / TIMESTAMP ENDPOINT ─────────────────────────────────────────────────
 
 class AskRequest(BaseModel):
     video_url: str
@@ -185,99 +182,57 @@ class AskResponse(BaseModel):
     video_url: str
     topic: str
 
-def download_audio(video_url: str, tmpdir: str) -> str:
-    """Download audio using yt-dlp. Returns path to audio file."""
-    output_template = os.path.join(tmpdir, "audio.%(ext)s")
-    cmd = [
-        "yt-dlp",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--audio-quality", "5",       # medium quality, smaller file
-        "--output", output_template,
-        "--no-warnings",
-        "--quiet",
-        video_url
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    
-    # Find downloaded file
-    for ext in ["mp3", "m4a", "ogg", "wav", "opus", "webm"]:
-        path = os.path.join(tmpdir, f"audio.{ext}")
-        if os.path.exists(path):
-            return path
-    
-    # Glob fallback
-    files = glob.glob(os.path.join(tmpdir, "audio.*"))
-    if files:
-        return files[0]
-    
-    raise FileNotFoundError(f"Audio download failed. stderr: {result.stderr[:500]}")
 
-def ask_gemini_for_timestamp(audio_path: str, topic: str) -> str:
-    """Upload audio to Gemini and ask for timestamp."""
-    genai.configure(api_key=GEMINI_API_KEY)
-    
-    # Upload audio file
-    print(f"Uploading audio file: {audio_path} ({os.path.getsize(audio_path)//1024}KB)")
-    audio_file = genai.upload_file(
-        path=audio_path,
-        mime_type="audio/mpeg"
-    )
-    
-    # Wait for file to be processed
-    while audio_file.state.name == "PROCESSING":
-        time.sleep(2)
-        audio_file = genai.get_file(audio_file.name)
-    
-    if audio_file.state.name == "FAILED":
-        raise ValueError("Gemini file processing failed")
-    
-    # Ask Gemini for timestamp
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    
-    prompt = f"""Listen to this audio carefully.
+def find_timestamp_gemini(video_url: str, topic: str) -> str:
+    """
+    Pass YouTube URL directly to Gemini — no audio download needed.
+    Gemini 2.0 Flash supports YouTube URLs natively.
+    """
+    gemini_client = google_genai.Client(api_key=GEMINI_API_KEY)
 
-Find the EXACT moment when the speaker FIRST mentions or discusses this topic:
+    prompt = f"""Watch this YouTube video carefully.
+
+Find the EXACT timestamp (HH:MM:SS) when this topic is FIRST spoken or discussed:
 "{topic}"
 
-Return ONLY the timestamp in HH:MM:SS format (e.g., 00:58:49).
-Do not include any explanation, just the timestamp."""
+Rules:
+- Give me the moment the speaker FIRST says this, not the chapter heading time.
+- Return ONLY the timestamp in HH:MM:SS format, nothing else.
+- Example valid response: 00:58:49
+- If you cannot find it, return: 00:00:00
+"""
 
-    response = model.generate_content([audio_file, prompt])
-    raw = response.text.strip()
-    print(f"Gemini raw response: {raw}")
-    
+    response = gemini_client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=genai_types.Content(
+            parts=[
+                genai_types.Part(
+                    file_data=genai_types.FileData(
+                        file_uri=video_url,
+                        mime_type="video/*"
+                    )
+                ),
+                genai_types.Part(text=prompt)
+            ]
+        )
+    )
+
+    text = response.text.strip()
     # Extract HH:MM:SS from response
     import re as re2
-    match = re2.search(r'\d{1,2}:\d{2}:\d{2}', raw)
+    match = re2.search(r'\d{1,2}:\d{2}:\d{2}', text)
     if match:
-        ts = match.group(0)
-        # Ensure HH:MM:SS format
-        parts = ts.split(':')
-        if len(parts) == 3:
-            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
-            return f"{h:02d}:{m:02d}:{s:02d}"
-    
-    # Try MM:SS format
-    match2 = re2.search(r'\d{1,2}:\d{2}', raw)
-    if match2:
-        parts = match2.group(0).split(':')
-        m, s = int(parts[0]), int(parts[1])
-        return f"00:{m:02d}:{s:02d}"
-    
+        raw = match.group(0)
+        parts = raw.split(":")
+        h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+        return f"{h:02d}:{m:02d}:{s:02d}"
     return "00:00:00"
 
 
 @app.post("/ask", response_model=AskResponse)
 async def find_timestamp(request: AskRequest):
-    tmpdir = tempfile.mkdtemp()
     try:
-        # Step 1: Download audio
-        audio_path = download_audio(request.video_url, tmpdir)
-        
-        # Step 2: Ask Gemini with audio
-        timestamp = ask_gemini_for_timestamp(audio_path, request.topic)
-        
+        timestamp = find_timestamp_gemini(request.video_url, request.topic)
         return AskResponse(
             timestamp=timestamp,
             video_url=request.video_url,
@@ -285,5 +240,3 @@ async def find_timestamp(request: AskRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
