@@ -2,35 +2,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
-import json
-import os
-import sys
+import json, os, sys, re, traceback
 from io import StringIO
-import traceback
 from typing import List
-import subprocess
-import re
-import tempfile
-import glob
-from google import genai as google_genai
-from google.genai import types as genai_types
 
 app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+client = OpenAI(api_key=os.environ.get("AIPIPE_TOKEN"), base_url="https://aipipe.org/openai/v1")
 
-client = OpenAI(
-    api_key=os.environ.get("AIPIPE_TOKEN"),
-    base_url="https://aipipe.org/openai/v1"
-)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-# ─── SENTIMENT ENDPOINT ───────────────────────────────────────────────────────
+# ── SENTIMENT ─────────────────────────────────────────────────────────────────
 class CommentRequest(BaseModel):
     comment: str
 
@@ -38,60 +19,23 @@ class SentimentResponse(BaseModel):
     sentiment: str
     rating: int
 
-SENTIMENT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "sentiment": {
-            "type": "string",
-            "enum": ["positive", "negative", "neutral"]
-        },
-        "rating": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 5
-        }
-    },
-    "required": ["sentiment", "rating"],
-    "additionalProperties": False
-}
-
 @app.post("/comment", response_model=SentimentResponse)
 async def analyze_comment(request: CommentRequest):
-    if not request.comment or not request.comment.strip():
-        raise HTTPException(status_code=422, detail="Comment cannot be empty")
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a sentiment analysis engine. "
-                        "Analyze the comment and return sentiment "
-                        "('positive','negative','neutral') and "
-                        "rating (1-5 where 5=very positive, 1=very negative)."
-                    )
-                },
-                {"role": "user", "content": request.comment}
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "sentiment_analysis",
-                    "strict": True,
-                    "schema": SENTIMENT_SCHEMA
-                }
-            }
-        )
-        result = json.loads(response.choices[0].message.content)
-        return SentimentResponse(**result)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Model returned invalid JSON")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": "Analyze sentiment. Return JSON with sentiment (positive/negative/neutral) and rating (1-5)."},
+            {"role": "user", "content": request.comment}
+        ],
+        response_format={"type": "json_schema", "json_schema": {"name": "s", "strict": True, "schema": {
+            "type": "object",
+            "properties": {"sentiment": {"type": "string", "enum": ["positive","negative","neutral"]}, "rating": {"type": "integer"}},
+            "required": ["sentiment","rating"], "additionalProperties": False
+        }}}
+    )
+    return SentimentResponse(**json.loads(response.choices[0].message.content))
 
-
-# ─── CODE INTERPRETER ENDPOINT ───────────────────────────────────────────────
+# ── CODE INTERPRETER ──────────────────────────────────────────────────────────
 class CodeRequest(BaseModel):
     code: str
 
@@ -99,80 +43,34 @@ class CodeResponse(BaseModel):
     error: List[int]
     result: str
 
-def execute_python_code(code: str) -> dict:
+@app.post("/code-interpreter", response_model=CodeResponse)
+async def code_interpreter(request: CodeRequest):
     old_stdout = sys.stdout
     sys.stdout = StringIO()
     try:
-        exec(code, {})
+        exec(request.code, {})
         output = sys.stdout.getvalue()
-        return {"success": True, "output": output}
-    except Exception:
-        output = traceback.format_exc()
-        return {"success": False, "output": output}
-    finally:
         sys.stdout = old_stdout
-
-ERROR_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "error_lines": {
-            "type": "array",
-            "items": {"type": "integer"}
-        }
-    },
-    "required": ["error_lines"],
-    "additionalProperties": False
-}
-
-def analyze_error_with_ai(code: str, traceback_output: str) -> List[int]:
-    prompt = f"""Analyze this Python code and its error traceback.
-Identify the line number(s) where the error occurred.
-
-CODE:
-{code}
-
-TRACEBACK:
-{traceback_output}
-
-Return only the line number(s) where the error is located."""
-
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a Python error analysis expert. Identify exact line numbers where errors occur."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "error_analysis",
-                "strict": True,
-                "schema": ERROR_SCHEMA
-            }
-        }
-    )
-    result = json.loads(response.choices[0].message.content)
-    return result["error_lines"]
-
-@app.post("/code-interpreter", response_model=CodeResponse)
-async def code_interpreter(request: CodeRequest):
-    if not request.code or not request.code.strip():
-        raise HTTPException(status_code=422, detail="Code cannot be empty")
-    execution_result = execute_python_code(request.code)
-    if execution_result["success"]:
-        return CodeResponse(error=[], result=execution_result["output"])
-    try:
-        error_lines = analyze_error_with_ai(request.code, execution_result["output"])
+        return CodeResponse(error=[], result=output)
     except Exception:
-        error_lines = []
-    return CodeResponse(error=error_lines, result=execution_result["output"])
+        tb = traceback.format_exc()
+        sys.stdout = old_stdout
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": "Return JSON with error_lines (array of int line numbers)."},
+                {"role": "user", "content": f"Code:\n{request.code}\n\nError:\n{tb}"}
+            ],
+            response_format={"type": "json_schema", "json_schema": {"name": "e", "strict": True, "schema": {
+                "type": "object",
+                "properties": {"error_lines": {"type": "array", "items": {"type": "integer"}}},
+                "required": ["error_lines"], "additionalProperties": False
+            }}}
+        )
+        result = json.loads(response.choices[0].message.content)
+        return CodeResponse(error=result["error_lines"], result=tb)
 
-# ─── YOUTUBE TIMESTAMP ENDPOINT ──────────────────────────────────────────────
-# ── ASK / TIMESTAMP ENDPOINT ─────────────────────────────────────────────────
-
+# ── ASK / TIMESTAMP ───────────────────────────────────────────────────────────
 class AskRequest(BaseModel):
     video_url: str
     topic: str
@@ -182,61 +80,80 @@ class AskResponse(BaseModel):
     video_url: str
     topic: str
 
+def get_video_id(url: str) -> str:
+    m = re.search(r'(?:v=|youtu\.be/|/v/)([^&\n?#]+)', url)
+    return m.group(1) if m else None
 
-def find_timestamp_gemini(video_url: str, topic: str) -> str:
-    """
-    Pass YouTube URL directly to Gemini — no audio download needed.
-    Gemini 2.0 Flash supports YouTube URLs natively.
-    """
-    gemini_client = google_genai.Client(api_key=GEMINI_API_KEY)
-
-    prompt = f"""Watch this YouTube video carefully.
-
-Find the EXACT timestamp (HH:MM:SS) when this topic is FIRST spoken or discussed:
-"{topic}"
-
-Rules:
-- Give me the moment the speaker FIRST says this, not the chapter heading time.
-- Return ONLY the timestamp in HH:MM:SS format, nothing else.
-- Example valid response: 00:58:49
-- If you cannot find it, return: 00:00:00
-"""
-
-    response = gemini_client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=genai_types.Content(
-            parts=[
-                genai_types.Part(
-                    file_data=genai_types.FileData(
-                        file_uri=video_url,
-                        mime_type="video/*"
-                    )
-                ),
-                genai_types.Part(text=prompt)
-            ]
-        )
-    )
-
-    text = response.text.strip()
-    # Extract HH:MM:SS from response
-    import re as re2
-    match = re2.search(r'\d{1,2}:\d{2}:\d{2}', text)
-    if match:
-        raw = match.group(0)
-        parts = raw.split(":")
-        h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return "00:00:00"
-
+def secs_to_ts(sec: float) -> str:
+    sec = int(sec)
+    return f"{sec//3600:02d}:{(sec%3600)//60:02d}:{sec%60:02d}"
 
 @app.post("/ask", response_model=AskResponse)
 async def find_timestamp(request: AskRequest):
     try:
-        timestamp = find_timestamp_gemini(request.video_url, request.topic)
-        return AskResponse(
-            timestamp=timestamp,
-            video_url=request.video_url,
-            topic=request.topic
+        from youtube_transcript_api import YouTubeTranscriptApi
+
+        video_id = get_video_id(request.video_url)
+        if not video_id:
+            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+
+        # Fetch transcript
+        try:
+            api = YouTubeTranscriptApi()
+            entries = list(api.fetch(video_id, languages=['en']))
+        except Exception:
+            try:
+                api = YouTubeTranscriptApi()
+                listing = api.list(video_id)
+                transcript = listing.find_generated_transcript(['en']).fetch()
+                entries = list(transcript)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Transcript fetch failed: {e}")
+
+        # Build timestamped transcript (full, no truncation)
+        lines = [f"[{secs_to_ts(e.start)}] {e.text}" for e in entries]
+        full_transcript = "\n".join(lines)
+
+        # Direct text search first (free, instant)
+        topic_lower = request.topic.lower()
+        for window in [1, 2, 3, 5]:
+            for i in range(len(entries)):
+                chunk = entries[i:i+window]
+                combined = " ".join(e.text for e in chunk).lower()
+                if topic_lower in combined:
+                    return AskResponse(timestamp=secs_to_ts(chunk[0].start), video_url=request.video_url, topic=request.topic)
+
+        # Keyword scoring fallback
+        words = [w for w in topic_lower.split() if len(w) > 4]
+        best_score, best_sec = 0, 0
+        for i in range(len(entries)):
+            chunk = entries[i:i+5]
+            combined = " ".join(e.text for e in chunk).lower()
+            score = sum(1 for w in words if w in combined)
+            if score > best_score:
+                best_score, best_sec = score, chunk[0].start
+
+        if best_score >= max(2, len(words) // 2):
+            return AskResponse(timestamp=secs_to_ts(best_sec), video_url=request.video_url, topic=request.topic)
+
+        # GPT on full transcript (fits in 128k context)
+        ai_response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": 'Return JSON: {"timestamp": "HH:MM:SS"} for the first occurrence of the topic.'},
+                {"role": "user", "content": f'Topic: "{request.topic}"\n\nTranscript:\n{full_transcript[:100000]}'}
+            ],
+            response_format={"type": "json_schema", "json_schema": {"name": "ts", "strict": True, "schema": {
+                "type": "object",
+                "properties": {"timestamp": {"type": "string"}},
+                "required": ["timestamp"], "additionalProperties": False
+            }}},
+            max_tokens=20
         )
+        ts = json.loads(ai_response.choices[0].message.content).get("timestamp", "00:00:00")
+        return AskResponse(timestamp=ts, video_url=request.video_url, topic=request.topic)
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
