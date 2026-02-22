@@ -170,10 +170,11 @@ async def code_interpreter(request: CodeRequest):
 
 # ─── YOUTUBE TIMESTAMP ENDPOINT ──────────────────────────────────────────────
 
-import glob
-import subprocess
-import tempfile
-import shutil
+import glob, subprocess, tempfile, shutil, time
+import google.generativeai as genai
+
+# Configure Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 class AskRequest(BaseModel):
     video_url: str
@@ -184,181 +185,86 @@ class AskResponse(BaseModel):
     video_url: str
     topic: str
 
-def get_video_id(url: str) -> str:
-    import re
-    m = re.search(r'(?:v=|youtu\.be/|/v/)([^&\n?#]+)', url)
-    return m.group(1) if m else None
+def download_audio(video_url: str, tmpdir: str) -> str:
+    """Download audio using yt-dlp. Returns path to audio file."""
+    output_template = os.path.join(tmpdir, "audio.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "5",       # medium quality, smaller file
+        "--output", output_template,
+        "--no-warnings",
+        "--quiet",
+        video_url
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    
+    # Find downloaded file
+    for ext in ["mp3", "m4a", "ogg", "wav", "opus", "webm"]:
+        path = os.path.join(tmpdir, f"audio.{ext}")
+        if os.path.exists(path):
+            return path
+    
+    # Glob fallback
+    files = glob.glob(os.path.join(tmpdir, "audio.*"))
+    if files:
+        return files[0]
+    
+    raise FileNotFoundError(f"Audio download failed. stderr: {result.stderr[:500]}")
 
-def seconds_to_hhmmss(sec: float) -> str:
-    sec = int(sec)
-    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
+def ask_gemini_for_timestamp(audio_path: str, topic: str) -> str:
+    """Upload audio to Gemini and ask for timestamp."""
+    genai.configure(api_key=GEMINI_API_KEY)
+    
+    # Upload audio file
+    print(f"Uploading audio file: {audio_path} ({os.path.getsize(audio_path)//1024}KB)")
+    audio_file = genai.upload_file(
+        path=audio_path,
+        mime_type="audio/mpeg"
+    )
+    
+    # Wait for file to be processed
+    while audio_file.state.name == "PROCESSING":
+        time.sleep(2)
+        audio_file = genai.get_file(audio_file.name)
+    
+    if audio_file.state.name == "FAILED":
+        raise ValueError("Gemini file processing failed")
+    
+    # Ask Gemini for timestamp
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    
+    prompt = f"""Listen to this audio carefully.
 
-def get_transcript_entries(video_url: str, tmpdir: str):
-    """
-    Returns list of (start_seconds, text) tuples.
-    Tries: 1) youtube-transcript-api  2) yt-dlp VTT
-    """
-    import re as re2
-
-    # --- Method 1: youtube-transcript-api ---
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-        video_id = get_video_id(video_url)
-        if video_id:
-            try:
-                api = YouTubeTranscriptApi()
-                transcript = api.fetch(video_id, languages=['en'])
-                entries = [(e.start, e.text) for e in transcript]
-                if entries:
-                    return entries
-            except Exception:
-                pass
-            # try without language filter
-            try:
-                api = YouTubeTranscriptApi()
-                listing = api.list(video_id)
-                transcript = listing.find_generated_transcript(['en']).fetch()
-                entries = [(e.start, e.text) for e in transcript]
-                if entries:
-                    return entries
-            except Exception:
-                pass
-    except ImportError:
-        pass
-
-    # --- Method 2: yt-dlp VTT ---
-    output_template = os.path.join(tmpdir, "sub")
-    for flag in ["--write-auto-subs", "--write-subs"]:
-        cmd = [
-            "yt-dlp", flag,
-            "--skip-download",
-            "--sub-lang", "en",
-            "--sub-format", "vtt",
-            "--output", output_template,
-            "--no-warnings", "--quiet",
-            video_url
-        ]
-        try:
-            subprocess.run(cmd, capture_output=True, timeout=120)
-        except Exception:
-            pass
-        vtt_files = glob.glob(os.path.join(tmpdir, "*.vtt"))
-        if vtt_files:
-            with open(vtt_files[0], 'r', encoding='utf-8') as f:
-                content = f.read()
-            entries = []
-            lines = content.split('\n')
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                ts = re2.match(r'(\d{2}):(\d{2}):(\d{2})\.\d+', line)
-                if ts and '-->' in line:
-                    h, m, s = int(ts.group(1)), int(ts.group(2)), int(ts.group(3))
-                    total_sec = h * 3600 + m * 60 + s
-                    i += 1
-                    text_parts = []
-                    while i < len(lines) and lines[i].strip():
-                        clean = re2.sub(r'<[^>]+>', '', lines[i].strip())
-                        if clean:
-                            text_parts.append(clean)
-                        i += 1
-                    if text_parts:
-                        entries.append((total_sec, ' '.join(text_parts)))
-                else:
-                    i += 1
-            if entries:
-                return entries
-
-    return []
-
-def find_timestamp_with_ai(entries: list, topic: str) -> str:
-    """Send FULL transcript to AI in one call. 128k context fits any video."""
-    # Build timestamped transcript
-    lines = []
-    for sec, text in entries:
-        ts = seconds_to_hhmmss(sec)
-        lines.append(f"[{ts}] {text}")
-    full_transcript = '\n'.join(lines)
-
-    # First try direct substring match (no AI needed, instant)
-    topic_lower = topic.lower().strip()
-    # sliding window of 1-5 consecutive entries
-    for window in [1, 2, 3, 5]:
-        for i in range(len(entries)):
-            chunk = entries[i:i+window]
-            combined = ' '.join(t for _, t in chunk).lower()
-            if topic_lower in combined:
-                return seconds_to_hhmmss(chunk[0][0])
-    # partial phrase match (first 30 chars of topic)
-    partial = topic_lower[:40]
-    for i in range(len(entries)):
-        chunk = entries[i:i+3]
-        combined = ' '.join(t for _, t in chunk).lower()
-        if partial in combined:
-            return seconds_to_hhmmss(chunk[0][0])
-
-    # Keyword match: find most keyword-dense segment
-    topic_words = [w for w in topic_lower.split() if len(w) > 4]
-    if topic_words:
-        best_score, best_sec = 0, None
-        for i in range(len(entries)):
-            chunk = entries[i:i+5]
-            combined = ' '.join(t for _, t in chunk).lower()
-            score = sum(1 for w in topic_words if w in combined)
-            if score > best_score:
-                best_score = score
-                best_sec = chunk[0][0]
-        if best_sec is not None and best_score >= max(2, len(topic_words) // 2):
-            return seconds_to_hhmmss(best_sec)
-
-    # AI fallback: send full transcript (fits in 128k context)
-    # Truncate to 100k chars max (~75k tokens) if very long
-    if len(full_transcript) > 100000:
-        # Send in two halves if needed
-        half = len(full_transcript) // 2
-        segments = [full_transcript[:half + 5000], full_transcript[half - 5000:]]
-    else:
-        segments = [full_transcript]
-
-    for segment in segments:
-        prompt = f"""You are analyzing a YouTube video transcript with timestamps.
-
-Find the FIRST moment this topic is spoken:
+Find the EXACT moment when the speaker FIRST mentions or discusses this topic:
 "{topic}"
 
-TRANSCRIPT:
-{segment}
+Return ONLY the timestamp in HH:MM:SS format (e.g., 00:58:49).
+Do not include any explanation, just the timestamp."""
 
-Return the HH:MM:SS timestamp from the transcript line where this topic FIRST appears.
-If not in this segment, return exactly: NOT_FOUND"""
-
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": 'Return ONLY a JSON object: {"timestamp": "HH:MM:SS"} or {"timestamp": "NOT_FOUND"}'},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "ts",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {"timestamp": {"type": "string"}},
-                        "required": ["timestamp"],
-                        "additionalProperties": False
-                    }
-                }
-            },
-            max_tokens=50
-        )
-        result = json.loads(response.choices[0].message.content)
-        ts = result.get("timestamp", "NOT_FOUND")
-        if ts != "NOT_FOUND" and re.match(r'^\d{2}:\d{2}:\d{2}$', ts):
-            return ts
-
+    response = model.generate_content([audio_file, prompt])
+    raw = response.text.strip()
+    print(f"Gemini raw response: {raw}")
+    
+    # Extract HH:MM:SS from response
+    import re as re2
+    match = re2.search(r'\d{1,2}:\d{2}:\d{2}', raw)
+    if match:
+        ts = match.group(0)
+        # Ensure HH:MM:SS format
+        parts = ts.split(':')
+        if len(parts) == 3:
+            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+            return f"{h:02d}:{m:02d}:{s:02d}"
+    
+    # Try MM:SS format
+    match2 = re2.search(r'\d{1,2}:\d{2}', raw)
+    if match2:
+        parts = match2.group(0).split(':')
+        m, s = int(parts[0]), int(parts[1])
+        return f"00:{m:02d}:{s:02d}"
+    
     return "00:00:00"
 
 
@@ -366,18 +272,18 @@ If not in this segment, return exactly: NOT_FOUND"""
 async def find_timestamp(request: AskRequest):
     tmpdir = tempfile.mkdtemp()
     try:
-        entries = get_transcript_entries(request.video_url, tmpdir)
+        # Step 1: Download audio
+        audio_path = download_audio(request.video_url, tmpdir)
         
-        if not entries:
-            # No transcript available at all
-            raise HTTPException(status_code=400, detail="Could not download transcript for this video")
-        
-        timestamp = find_timestamp_with_ai(entries, request.topic)
+        # Step 2: Ask Gemini with audio
+        timestamp = ask_gemini_for_timestamp(audio_path, request.topic)
         
         return AskResponse(
             timestamp=timestamp,
             video_url=request.video_url,
             topic=request.topic
         )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

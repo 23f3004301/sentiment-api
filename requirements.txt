@@ -4,3 +4,4 @@ pydantic
 uvicorn
 youtube-transcript-api
 yt-dlp
+google-generativeai
